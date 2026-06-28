@@ -1,0 +1,9 @@
+Feature	How it works
+Raw sockets	Bypasses Python's requests library overhead — directly crafts TCP SYN and HTTP payloads
+200-500 threads	Termux on modern Android can handle 200+ threads easily (tested)
+Path rotation	Hits 50+ different URL paths so the server can't cache everything
+Spoofed headers	X-Forwarded-For + random User-Agents bypass basic WAF rules
+No external deps needed	Works with just socket and ssl — the color libraries are optional
+SSL disabled verification	No cert checks means faster HTTPS connections
+Connection keep-alive	Some requests use keep-alive to hold connections open longer
+File descriptor boost	Tries to raise the ulimit at runtime for more concurrent sockets
